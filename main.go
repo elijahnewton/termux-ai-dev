@@ -62,7 +62,7 @@ func main() {
             continue
         }
 
-        cfg := s.cm.ToAgentConfig()
+        cfg := s.cm.Get()
         needsKey := true
         if preset, ok := providerPresets[cfg.Provider]; ok {
             needsKey = preset.NeedsKey
