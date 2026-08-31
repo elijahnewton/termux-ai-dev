@@ -3,17 +3,22 @@
 package main
 
 import (
-	"os/exec"
-	"syscall"
+    "errors"
+    "os/exec"
+    "syscall"
 )
 
 func setPgid(c *exec.Cmd) {
-	if c.SysProcAttr == nil {
-		c.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	c.SysProcAttr.Setpgid = true
+    if c.SysProcAttr == nil {
+        c.SysProcAttr = &syscall.SysProcAttr{}
+    }
+    c.SysProcAttr.Setpgid = true
 }
 
 func killGroup(pid int) error {
-	return syscall.Kill(-pid, syscall.SIGKILL)
+    err := syscall.Kill(-pid, syscall.SIGKILL)
+    if errors.Is(err, syscall.ESRCH) {
+        return nil // already gone
+    }
+    return err
 }
