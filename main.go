@@ -1,398 +1,357 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"fmt"
-	"os"
-	"sort"
-	"strings"
-	"time"
+    "bufio"
+    "context"
+    "fmt"
+    "os"
+    "sort"
+    "strconv"
+    "strings"
+    "time"
 )
 
-func main() {
-	cm := NewConfigManager()
+// Single shared reader for all stdin input. Mixing bufio.Scanner, ad-hoc
+// bufio.Readers and fmt.Scanln on the same fd loses buffered data.
+var stdin = bufio.NewReader(os.Stdin)
 
-	fmt.Println()
-	fmt.Println("  Termux Agent")
-	fmt.Println("  Interactive AI assistant for Android Termux")
-	fmt.Println()
-	fmt.Println("  Type a message to chat, or use slash commands:")
-	fmt.Println("    /help, /?           Show this help")
-	fmt.Println("    /provider           Choose a provider (OpenAI, OpenRouter, Groq, Ollama, etc.)")
-	fmt.Println("    /model              Set or change the model")
-	fmt.Println("    /endpoint           Set a custom API endpoint")
-	fmt.Println("    /key                Set or update the API key")
-	fmt.Println("    /status             Show current configuration")
-	fmt.Println("    /settings           Adjust max-tokens, history-budget, shell-timeout, max-turns")
-	fmt.Println("    /header             Add or remove custom HTTP headers")
-	fmt.Println("    /reset              Reset configuration to defaults")
-	fmt.Println("    /exit, /quit        Leave")
-	fmt.Println()
-
-	agent := NewAgent(cm.ToAgentConfig())
-	scanner := bufio.NewScanner(os.Stdin)
-
-	for {
-		fmt.Fprint(os.Stderr, "[1;32m>[0m ")
-		if !scanner.Scan() {
-			break
-		}
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		if strings.HasPrefix(line, "/") {
-			handled := handleSlash(line, cm, &agent)
-			if !handled {
-				break
-			}
-			continue
-		}
-
-		cfg := cm.ToAgentConfig()
-		if cfg.APIKey == "" && cfg.Provider != "ollama" && cfg.Provider != "lmstudio" && cfg.Provider != "vllm" {
-			fmt.Fprintln(os.Stderr, "[1;31mNo API key configured. Use /key to set one, or /provider to switch to a local model.[0m")
-			continue
-		}
-		if cfg.Endpoint == "" {
-			fmt.Fprintln(os.Stderr, "[1;31mNo endpoint configured. Use /endpoint to set one.[0m")
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		resp, err := agent.RunTurn(ctx, line)
-		cancel()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[1;31mError:[0m %v
-", err)
-			continue
-		}
-		if resp != "" {
-			fmt.Println(resp)
-		}
-	}
+// readLine prints prompt to stderr and reads one trimmed line from stdin.
+// ok is false on EOF/read error.
+func readLine(prompt string) (string, bool) {
+    if prompt != "" {
+        fmt.Fprint(os.Stderr, prompt)
+    }
+    line, err := stdin.ReadString('\n')
+    line = strings.TrimSpace(line) // also strips \r on CRLF terminals
+    if err != nil {
+        return line, false
+    }
+    return line, true
 }
 
-func handleSlash(line string, cm *ConfigManager, agentPtr **Agent) bool {
-	parts := strings.Fields(line)
-	if len(parts) == 0 {
-		return true
-	}
-	cmd := parts[0]
+// session bundles the mutable pieces the slash commands operate on.
+type session struct {
+    cm    *ConfigManager
+    agent *Agent
+}
 
-	switch cmd {
-	case "/exit", "/quit":
-		fmt.Println("Goodbye.")
-		return false
+func main() {
+    cm := NewConfigManager()
+    s := &session{cm: cm, agent: NewAgent(cm.ToAgentConfig())}
 
-	case "/help", "/?":
-		printHelp()
+    fmt.Println()
+    fmt.Println("  Termux Agent")
+    fmt.Println("  Interactive AI assistant for Android Termux")
+    fmt.Println()
+    printHelp()
+    fmt.Println()
 
-	case "/provider":
-		interactiveProvider(cm, agentPtr)
+    for {
+        line, ok := readLine("\033[1;32m>\033[0m ")
+        if !ok {
+            break // EOF (Ctrl-D)
+        }
+        if line == "" {
+            continue
+        }
 
-	case "/model":
-		interactiveModel(cm, agentPtr)
+        if strings.HasPrefix(line, "/") {
+            if !handleSlash(line, s) {
+                break
+            }
+            continue
+        }
 
-	case "/endpoint":
-		interactiveEndpoint(cm, agentPtr)
+        cfg := s.cm.ToAgentConfig()
+        needsKey := true
+        if preset, ok := providerPresets[cfg.Provider]; ok {
+            needsKey = preset.NeedsKey
+        }
+        if cfg.APIKey == "" && needsKey {
+            fmt.Fprintln(os.Stderr, "\033[1;31mNo API key configured. Use /key to set one, or /provider to switch to a local model.\033[0m")
+            continue
+        }
+        if cfg.Endpoint == "" {
+            fmt.Fprintln(os.Stderr, "\033[1;31mNo endpoint configured. Use /endpoint to set one.\033[0m")
+            continue
+        }
 
-	case "/key":
-		interactiveKey(cm, agentPtr)
+        ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+        resp, err := s.agent.RunTurn(ctx, line)
+        cancel()
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "\033[1;31mError:\033[0m %v\n", err)
+            continue
+        }
+        if resp == "" {
+            fmt.Fprintln(os.Stderr, "\033[1;33m(empty response from model)\033[0m")
+            continue
+        }
+        fmt.Println(resp)
+    }
+}
 
-	case "/status":
-		fmt.Println(cm.Status())
+func handleSlash(line string, s *session) bool {
+    parts := strings.Fields(line)
+    if len(parts) == 0 {
+        return true
+    }
 
-	case "/settings":
-		interactiveSettings(cm, agentPtr)
+    switch parts[0] {
+    case "/exit", "/quit":
+        fmt.Println("Goodbye.")
+        return false
 
-	case "/header":
-		interactiveHeaders(cm, agentPtr)
+    case "/help", "/?":
+        printHelp()
 
-	case "/reset":
-		fmt.Print("Reset all settings to default? (y/N): ")
-		var confirm string
-		fmt.Scanln(&confirm)
-		if strings.ToLower(confirm) == "y" {
-			cfg := defaultUserConfig()
-			_ = saveUserConfig(cfg)
-			*cm = *NewConfigManager()
-			*agentPtr = NewAgent(cm.ToAgentConfig())
-			fmt.Println("Settings reset.")
-		} else {
-			fmt.Println("Cancelled.")
-		}
+    case "/provider":
+        interactiveProvider(s)
 
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s. Type /help for available commands.
-", cmd)
-	}
-	return true
+    case "/model":
+        interactiveModel(s)
+
+    case "/endpoint":
+        interactiveEndpoint(s)
+
+    case "/key":
+        interactiveKey(s)
+
+    case "/status":
+        fmt.Println(s.cm.Status())
+
+    case "/settings":
+        interactiveSettings(s)
+
+    case "/header":
+        interactiveHeaders(s)
+
+    case "/reset":
+        ans, _ := readLine("Reset all settings to default? (y/N): ")
+        if strings.EqualFold(ans, "y") {
+            if err := s.cm.Reset(); err != nil {
+                fmt.Fprintln(os.Stderr, "Error:", err)
+                return true
+            }
+            s.agent = NewAgent(s.cm.ToAgentConfig())
+            fmt.Println("Settings reset (API key cleared — use /key to set it again).")
+        } else {
+            fmt.Println("Cancelled.")
+        }
+
+    default:
+        fmt.Fprintf(os.Stderr, "Unknown command: %s. Type /help for available commands.\n", parts[0])
+    }
+    return true
 }
 
 func printHelp() {
-	fmt.Println("Slash commands:")
-	fmt.Println("  /help, /?           Show this help")
-	fmt.Println("  /provider           Choose a provider (OpenAI, OpenRouter, Groq, Ollama, etc.)")
-	fmt.Println("  /model              Set or change the model")
-	fmt.Println("  /endpoint           Set a custom API endpoint")
-	fmt.Println("  /key                Set or update the API key")
-	fmt.Println("  /status             Show current configuration")
-	fmt.Println("  /settings           Adjust max-tokens, history-budget, shell-timeout, max-turns")
-	fmt.Println("  /header             Add or remove custom HTTP headers")
-	fmt.Println("  /reset              Reset configuration to defaults")
-	fmt.Println("  /exit, /quit        Leave")
+    fmt.Println("Slash commands:")
+    fmt.Println("  /help, /?           Show this help")
+    fmt.Println("  /provider           Choose a provider (OpenAI, OpenRouter, Groq, Ollama, etc.)")
+    fmt.Println("  /model              Set or change the model")
+    fmt.Println("  /endpoint           Set a custom API endpoint")
+    fmt.Println("  /key                Set or update the API key")
+    fmt.Println("  /status             Show current configuration")
+    fmt.Println("  /settings           Adjust max-tokens, history-budget, shell-timeout, max-turns")
+    fmt.Println("  /header             Add or remove custom HTTP headers")
+    fmt.Println("  /reset              Reset configuration to defaults")
+    fmt.Println("  /exit, /quit        Leave")
 }
 
-func interactiveProvider(cm *ConfigManager, agentPtr **Agent) {
-	fmt.Println("Available providers:")
-	keys := make([]string, 0, len(providerPresets))
-	for k := range providerPresets {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for i, k := range keys {
-		preset := providerPresets[k]
-		keyHint := ""
-		if preset.NeedsKey {
-			keyHint = " [requires API key]"
-		}
-		fmt.Printf("  %d. %-12s %s%s
-", i+1, k, preset.Name, keyHint)
-	}
-	fmt.Print("Choose provider (name or number): ")
-	var choice string
-	fmt.Scanln(&choice)
-	choice = strings.TrimSpace(strings.ToLower(choice))
+func interactiveProvider(s *session) {
+    fmt.Println("Available providers:")
+    keys := make([]string, 0, len(providerPresets))
+    for k := range providerPresets {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+    for i, k := range keys {
+        preset := providerPresets[k]
+        keyHint := ""
+        if preset.NeedsKey {
+            keyHint = " [requires API key]"
+        }
+        fmt.Printf("  %d. %-12s %s%s\n", i+1, k, preset.Name, keyHint)
+    }
+    choice, ok := readLine("Choose provider (name or number): ")
+    if !ok {
+        return
+    }
+    choice = strings.ToLower(choice)
 
-	for i, k := range keys {
-		if choice == fmt.Sprintf("%d", i+1) {
-			choice = k
-			break
-		}
-	}
-
-	if _, ok := providerPresets[choice]; !ok {
-		fmt.Println("Invalid provider.")
-		return
-	}
-
-	if err := cm.SetProvider(choice); err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-
-	preset := providerPresets[choice]
-	fmt.Printf("Provider set to %s.
-", preset.Name)
-	fmt.Printf("Endpoint: %s
-", preset.Endpoint)
-	if len(preset.Models) > 0 {
-		fmt.Printf("Default model: %s
-", preset.Models[0])
-	}
-	if preset.NeedsKey {
-		cfg := cm.Get()
-		if cfg.APIKey == "" {
-			fmt.Println("This provider requires an API key. Use /key to set one.")
-		}
-	}
-
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+    for i, k := range keys {
+        if choice == strconv.Itoa(i+1) {
+            choice = k
+            break
+        }
+    }
+    if _, ok := providerPresets[choice]; !ok {
+        fmt.Println("Invalid provider.")
+        return
+    }
+    if err := s.cm.SetProvider(choice); err != nil {
+        fmt.Fprintln(os.Stderr, "Error:", err)
+        return
+    }
+    preset := providerPresets[choice]
+    fmt.Printf("Provider set to %s.\nEndpoint: %s\n", preset.Name, preset.Endpoint)
+    if len(preset.Models) > 0 {
+        fmt.Printf("Default model: %s\n", preset.Models[0])
+    }
+    if preset.NeedsKey && s.cm.Get().APIKey == "" {
+        fmt.Println("This provider requires an API key. Use /key to set one.")
+    }
+    s.agent = NewAgent(s.cm.ToAgentConfig())
 }
 
-func interactiveModel(cm *ConfigManager, agentPtr **Agent) {
-	cfg := cm.Get()
-	preset, hasPreset := providerPresets[cfg.Provider]
-	if hasPreset && len(preset.Models) > 0 {
-		fmt.Println("Suggested models for this provider:")
-		for i, m := range preset.Models {
-			marker := " "
-			if m == cfg.Model {
-				marker = "*"
-			}
-			fmt.Printf("  %s %d. %s
-", marker, i+1, m)
-		}
-		fmt.Println("Or type any model name manually.")
-	}
-	fmt.Printf("Current model: %s
-New model: ", cfg.Model)
-	var choice string
-	fmt.Scanln(&choice)
-	choice = strings.TrimSpace(choice)
-	if choice == "" {
-		fmt.Println("No change.")
-		return
-	}
-
-	if hasPreset {
-		var idx int
-		if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil && idx > 0 && idx <= len(preset.Models) {
-			choice = preset.Models[idx-1]
-		}
-	}
-
-	if err := cm.SetModel(choice); err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	fmt.Printf("Model set to %s.
-", choice)
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+func interactiveModel(s *session) {
+    cfg := s.cm.Get()
+    preset, hasPreset := providerPresets[cfg.Provider]
+    if hasPreset && len(preset.Models) > 0 {
+        fmt.Println("Suggested models for this provider:")
+        for i, m := range preset.Models {
+            marker := " "
+            if m == cfg.Model {
+                marker = "*"
+            }
+            fmt.Printf("  %s %d. %s\n", marker, i+1, m)
+        }
+        fmt.Println("Or type any model name manually.")
+    }
+    choice, ok := readLine(fmt.Sprintf("Current model: %s\nNew model: ", cfg.Model))
+    if !ok || choice == "" {
+        fmt.Println("No change.")
+        return
+    }
+    // Exact-integer parse only: "7b" must not become model #7.
+    if hasPreset {
+        if idx, err := strconv.Atoi(choice); err == nil && idx > 0 && idx <= len(preset.Models) {
+            choice = preset.Models[idx-1]
+        }
+    }
+    if err := s.cm.SetModel(choice); err != nil {
+        fmt.Fprintln(os.Stderr, "Error:", err)
+        return
+    }
+    fmt.Printf("Model set to %s.\n", choice)
+    s.agent = NewAgent(s.cm.ToAgentConfig())
 }
 
-func interactiveEndpoint(cm *ConfigManager, agentPtr **Agent) {
-	cfg := cm.Get()
-	fmt.Printf("Current endpoint: %s
-New endpoint (or keep empty to keep current): ", cfg.Endpoint)
-	reader := bufio.NewReader(os.Stdin)
-	choice, _ := reader.ReadString('
-')
-	choice = strings.TrimSpace(choice)
-	if choice == "" {
-		fmt.Println("No change.")
-		return
-	}
-	if err := cm.SetEndpoint(choice); err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	fmt.Printf("Endpoint set to %s.
-", choice)
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+func interactiveEndpoint(s *session) {
+    cfg := s.cm.Get()
+    choice, ok := readLine(fmt.Sprintf("Current endpoint: %s\nNew endpoint (empty to keep current): ", cfg.Endpoint))
+    if !ok || choice == "" {
+        fmt.Println("No change.")
+        return
+    }
+    if err := s.cm.SetEndpoint(choice); err != nil {
+        fmt.Fprintln(os.Stderr, "Error:", err)
+        return
+    }
+    fmt.Printf("Endpoint set to %s.\n", choice)
+    s.agent = NewAgent(s.cm.ToAgentConfig())
 }
 
-func interactiveKey(cm *ConfigManager, agentPtr **Agent) {
-	cfg := cm.Get()
-	keyHint := "(not set)"
-	if cfg.APIKey != "" {
-		keyHint = "(set)"
-	}
-	fmt.Printf("Current API key: %s
-New API key (or keep empty to keep current): ", keyHint)
-	reader := bufio.NewReader(os.Stdin)
-	choice, _ := reader.ReadString('
-')
-	choice = strings.TrimSpace(choice)
-	if choice == "" {
-		fmt.Println("No change.")
-		return
-	}
-	if err := cm.SetAPIKey(choice); err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	fmt.Println("API key updated.")
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+func interactiveKey(s *session) {
+    cfg := s.cm.Get()
+    keyHint := "(not set)"
+    if cfg.APIKey != "" {
+        keyHint = "(set)"
+    }
+    choice, ok := readLine(fmt.Sprintf("Current API key: %s\nNew API key (empty to keep current): ", keyHint))
+    if !ok || choice == "" {
+        fmt.Println("No change.")
+        return
+    }
+    if err := s.cm.SetAPIKey(choice); err != nil {
+        fmt.Fprintln(os.Stderr, "Error:", err)
+        return
+    }
+    fmt.Println("API key updated.")
+    s.agent = NewAgent(s.cm.ToAgentConfig())
 }
 
-func interactiveSettings(cm *ConfigManager, agentPtr **Agent) {
-	cfg := cm.Get()
-	fmt.Printf("Current settings:
-  max-tokens: %d
-  history-budget: %d
-  shell-timeout: %ds
-  max-turns: %d
-",
-		cfg.MaxTokens, cfg.HistoryBudget, cfg.ShellTimeout, cfg.MaxTurns)
-	fmt.Println("Which setting to change? (tokens/budget/timeout/turns/cancel)")
-	var choice string
-	fmt.Scanln(&choice)
-	choice = strings.ToLower(strings.TrimSpace(choice))
+func interactiveSettings(s *session) {
+    cfg := s.cm.Get()
+    fmt.Printf("Current settings:\n  max-tokens: %d\n  history-budget: %d\n  shell-timeout: %ds\n  max-turns: %d\n",
+        cfg.MaxTokens, cfg.HistoryBudget, cfg.ShellTimeout, cfg.MaxTurns)
+    choice, ok := readLine("Which setting to change? (tokens/budget/timeout/turns/cancel) ")
+    if !ok {
+        return
+    }
+    choice = strings.ToLower(choice)
 
-	switch choice {
-	case "tokens":
-		fmt.Print("New max-tokens: ")
-		var v string
-		fmt.Scanln(&v)
-		n := parseIntOr(v, cfg.MaxTokens)
-		_ = cm.SetMaxTokens(n)
-		fmt.Printf("max-tokens set to %d.
-", n)
-	case "budget":
-		fmt.Print("New history-budget: ")
-		var v string
-		fmt.Scanln(&v)
-		n := parseIntOr(v, cfg.HistoryBudget)
-		_ = cm.SetHistoryBudget(n)
-		fmt.Printf("history-budget set to %d.
-", n)
-	case "timeout":
-		fmt.Print("New shell-timeout (seconds): ")
-		var v string
-		fmt.Scanln(&v)
-		n := parseIntOr(v, cfg.ShellTimeout)
-		_ = cm.SetShellTimeout(n)
-		fmt.Printf("shell-timeout set to %ds.
-", n)
-	case "turns":
-		fmt.Print("New max-turns: ")
-		var v string
-		fmt.Scanln(&v)
-		n := parseIntOr(v, cfg.MaxTurns)
-		_ = cm.SetMaxTurns(n)
-		fmt.Printf("max-turns set to %d.
-", n)
-	case "cancel", "":
-		fmt.Println("No changes.")
-		return
-	default:
-		fmt.Println("Unknown setting.")
-		return
-	}
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+    set := func(label string, cur int, fn func(int) error) {
+        v, _ := readLine(fmt.Sprintf("New %s: ", label))
+        n := parseIntOr(v, cur)
+        if err := fn(n); err != nil {
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            return
+        }
+        fmt.Printf("%s set to %d.\n", label, n)
+        s.agent = NewAgent(s.cm.ToAgentConfig())
+    }
+
+    switch choice {
+    case "tokens":
+        set("max-tokens", cfg.MaxTokens, s.cm.SetMaxTokens)
+    case "budget":
+        set("history-budget", cfg.HistoryBudget, s.cm.SetHistoryBudget)
+    case "timeout":
+        set("shell-timeout (seconds)", cfg.ShellTimeout, s.cm.SetShellTimeout)
+    case "turns":
+        set("max-turns", cfg.MaxTurns, s.cm.SetMaxTurns)
+    case "cancel", "":
+        fmt.Println("No changes.")
+    default:
+        fmt.Println("Unknown setting.")
+    }
 }
 
-func interactiveHeaders(cm *ConfigManager, agentPtr **Agent) {
-	cfg := cm.Get()
-	fmt.Println("Current custom headers:")
-	if len(cfg.ExtraHeaders) == 0 {
-		fmt.Println("  (none)")
-	} else {
-		for k, v := range cfg.ExtraHeaders {
-			fmt.Printf("  %s: %s
-", k, v)
-		}
-	}
-	fmt.Println("Actions: add / remove / back")
-	var choice string
-	fmt.Scanln(&choice)
-	choice = strings.ToLower(strings.TrimSpace(choice))
-
-	switch choice {
-	case "add":
-		fmt.Print("Header key: ")
-		var key string
-		fmt.Scanln(&key)
-		key = strings.TrimSpace(key)
-		if key == "" {
-			fmt.Println("Cancelled.")
-			return
-		}
-		fmt.Print("Header value: ")
-		reader := bufio.NewReader(os.Stdin)
-		val, _ := reader.ReadString('
-')
-		val = strings.TrimSpace(val)
-		_ = cm.SetExtraHeader(key, val)
-		fmt.Printf("Header %s added.
-", key)
-	case "remove":
-		fmt.Print("Header key to remove: ")
-		var key string
-		fmt.Scanln(&key)
-		key = strings.TrimSpace(key)
-		_ = cm.DeleteExtraHeader(key)
-		fmt.Printf("Header %s removed if it existed.
-", key)
-	case "back", "":
-		return
-	default:
-		fmt.Println("Unknown action.")
-		return
-	}
-	*agentPtr = NewAgent(cm.ToAgentConfig())
+func interactiveHeaders(s *session) {
+    cfg := s.cm.Get()
+    fmt.Println("Current custom headers:")
+    if len(cfg.ExtraHeaders) == 0 {
+        fmt.Println("  (none)")
+    } else {
+        for k, v := range cfg.ExtraHeaders {
+            fmt.Printf("  %s: %s\n", k, v)
+        }
+    }
+    choice, ok := readLine("Actions: add / remove / back ")
+    if !ok {
+        return
+    }
+    switch strings.ToLower(choice) {
+    case "add":
+        key, ok := readLine("Header key: ")
+        if !ok || key == "" {
+            fmt.Println("Cancelled.")
+            return
+        }
+        val, _ := readLine("Header value: ")
+        if err := s.cm.SetExtraHeader(key, val); err != nil {
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            return
+        }
+        fmt.Printf("Header %s added.\n", key)
+    case "remove":
+        key, ok := readLine("Header key to remove: ")
+        if !ok || key == "" {
+            fmt.Println("Cancelled.")
+            return
+        }
+        if err := s.cm.DeleteExtraHeader(key); err != nil {
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            return
+        }
+        fmt.Printf("Header %s removed if it existed.\n", key)
+    case "back", "":
+        return
+    default:
+        fmt.Println("Unknown action.")
+        return
+    }
+    s.agent = NewAgent(s.cm.ToAgentConfig())
 }
