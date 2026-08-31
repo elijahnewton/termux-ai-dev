@@ -1,0 +1,135 @@
+# Termux Agent
+
+A native Go CLI agent for Android Termux, reverse-engineered from desktop-class agentic utilities and optimized for severe mobile constraints: Phantom Process Killer awareness, aggressive token pruning, strict search/replace patching, and a minimal battery-friendly UI.
+
+## Features
+
+- **Interactive provider switching**: Change providers, models, endpoints, API keys, and settings on the fly using slash commands. No restart required.
+- **Universal OpenAI-compatible provider layer**: Works with OpenAI, OpenRouter, Together AI, Groq, AnyScale, local LLM servers (llama.cpp, ollama, vLLM, tabbyAPI, lm-studio), and any proxy exposing `/v1/chat/completions`.
+- **Provider-specific header support**: Pass custom HTTP headers for providers like OpenRouter that require `HTTP-Referer` and `X-Title`.
+- **Persistent configuration**: Settings are saved to `~/.config/termux-agent/config.json` and survive restarts.
+- **Aggressive memory compaction**: Recursive history pruning that collapses tool call blocks, compresses directory listings, and deduplicates repetitive compiler errors.
+- **Search/Replace patching**: Exact-match line-based patching so the agent never rewrites entire files across expensive mobile data connections.
+- **PPK-aware execution**: System prompt explicitly warns the LLM about Android's Phantom Process Killer, and the shell executor uses process groups and short timeouts to avoid zombie tasks.
+- **Zero external dependencies**: Pure Go standard library; cross-compiles to `android/arm64` without CGO.
+
+## Build
+
+### Cross-compile from desktop
+```bash
+env GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o termux-agent .
+```
+
+### Build directly in Termux
+```bash
+pkg install golang git
+ go build -ldflags="-s -w" -o termux-agent .
+```
+
+## Usage
+
+Launch the agent and use slash commands interactively:
+
+```bash
+./termux-agent
+```
+
+### Slash commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/provider` | Choose from OpenAI, OpenRouter, Groq, Ollama, LM Studio, vLLM, or Custom |
+| `/model` | Set or change the model (suggests provider defaults) |
+| `/endpoint` | Set a custom API endpoint URL |
+| `/key` | Set or update the API key |
+| `/status` | Show current configuration |
+| `/settings` | Adjust max-tokens, history-budget, shell-timeout, max-turns |
+| `/header` | Add or remove custom HTTP headers |
+| `/reset` | Reset configuration to defaults |
+| `/exit` | Leave |
+
+### Example session
+
+```bash
+$ ./termux-agent
+
+  Termux Agent
+  Interactive AI assistant for Android Termux
+
+> /provider
+Available providers:
+  1. custom       Custom Endpoint
+  2. groq         Groq [requires API key]
+  3. lmstudio     LM Studio (Local)
+  4. ollama       Ollama (Local)
+  5. openai       OpenAI [requires API key]
+  6. openrouter   OpenRouter [requires API key]
+  7. together     Together AI [requires API key]
+  8. vllm         vLLM (Local)
+Choose provider (name or number): openrouter
+Provider set to OpenRouter.
+Endpoint: https://openrouter.ai/api/v1/chat/completions
+Default model: anthropic/claude-3.5-sonnet
+This provider requires an API key. Use /key to set one.
+
+> /key
+Current API key: (not set)
+New API key (or keep empty to keep current): sk-or-v1-...
+API key updated.
+
+> /model
+Suggested models for this provider:
+   1. anthropic/claude-3.5-sonnet
+   2. meta-llama/llama-3.1-70b-instruct
+   3. openai/gpt-4o-mini
+   4. google/gemini-flash-1.5
+Or type any model name manually.
+Current model: anthropic/claude-3.5-sonnet
+New model: 3
+Model set to openai/gpt-4o-mini.
+
+> /status
+Provider: openrouter
+Endpoint: https://openrouter.ai/api/v1/chat/completions
+Model: openai/gpt-4o-mini
+API Key: (set)
+Max Tokens: 1024
+History Budget: 8000
+Shell Timeout: 15s
+Max Turns: 10
+
+> write a hello world in go
+```
+
+### Local LLM (ollama, llama.cpp, vLLM, lm-studio)
+
+```bash
+> /provider ollama
+> /model codellama
+```
+
+### Groq
+
+```bash
+> /provider groq
+> /key your-groq-key
+> /model llama3-70b-8192
+```
+
+## Architecture
+
+| File | Purpose |
+|------|---------|
+| `main.go` | Interactive REPL and slash command dispatch |
+| `config.go` | Persistent user config, provider presets, and live config updates |
+| `agent.go` | State machine, context pruning, tool dispatch, system prompt |
+| `shell.go` / `shell_unix.go` / `shell_generic.go` | Termux shell resolver, timeout execution, and process-group killing |
+| `patch.go` | Exact search/replace and diff-block extraction |
+| `provider.go` | OpenAI-compatible request/response translation with custom header injection |
+| `ui.go` | Minimal ANSI spinner with low refresh rate |
+
+## Security Notes
+
+- `apply_search_replace` is restricted to the current working directory and `HOME` to prevent path traversal.
+- `execute_command` runs in a new process group and is killed with `SIGKILL` on timeout to mitigate Phantom Process Killer side effects.
