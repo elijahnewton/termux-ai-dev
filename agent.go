@@ -6,6 +6,7 @@ import (
     "errors"
     "fmt"
     "net/http"
+    "strconv"
     "strings"
     "sync"
     "time"
@@ -140,6 +141,7 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (string, error) {
 
         choice := resp.Choices[0]
         assistantMsg := choice.Message
+        assistantMsg.ToolCalls = normalizeToolCalls(assistantMsg.ToolCalls)
         a.history = append(a.history, assistantMsg)
 
         if len(assistantMsg.ToolCalls) == 0 {
@@ -162,6 +164,50 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (string, error) {
     }
 
     return "", fmt.Errorf("max tool turns (%d) exceeded without final answer", maxTurns)
+}
+
+func normalizeToolCalls(calls []ToolCall) []ToolCall {
+    if len(calls) == 0 {
+    	return nil
+    }
+    out := make([]ToolCall, 0, len(calls))
+    for _, tc := range calls {
+    	tc.Function.Arguments = normalizeToolCallArguments(tc.Function.Name, tc.Function.Arguments)
+    	out = append(out, tc)
+    }
+    return out
+}
+
+func normalizeToolCallArguments(toolName, raw string) string {
+    raw = strings.TrimSpace(raw)
+    if raw == "" {
+    	return "{}"
+    }
+
+    var decoded interface{}
+    if err := json.Unmarshal([]byte(raw), &decoded); err == nil {
+    	switch v := decoded.(type) {
+    	case map[string]interface{}:
+    		b, err := json.Marshal(v)
+    		if err == nil {
+    			return string(b)
+    		}
+    	case string:
+    		if toolName == "execute_command" && strings.TrimSpace(v) != "" {
+    			return `{"command":` + strconv.Quote(v) + `}`
+    		}
+    	default:
+    		b, err := json.Marshal(map[string]interface{}{"value": v})
+    		if err == nil {
+    			return string(b)
+    		}
+    	}
+    }
+
+    if toolName == "execute_command" {
+    	return `{"command":` + strconv.Quote(raw) + `}`
+    }
+    return `{"_raw":` + strconv.Quote(raw) + `}`
 }
 
 // applyExtractedPatches applies ### path SEARCH/REPLACE blocks that the
