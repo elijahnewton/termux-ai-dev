@@ -81,6 +81,9 @@ func main() {
         cancel()
         if err != nil {
             fmt.Fprintf(os.Stderr, "\033[1;31mError:\033[0m %v\n", err)
+            if strings.Contains(err.Error(), "HTTP 400") {
+            	fmt.Fprintln(os.Stderr, "\033[1;33mHint:\033[0m check /provider, /model, /endpoint, and /key; some models reject tool-calling payloads.")
+            }
             continue
         }
         if resp == "" {

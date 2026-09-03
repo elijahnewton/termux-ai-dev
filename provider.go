@@ -70,8 +70,11 @@ type Choice struct {
 }
 
 type APIError struct {
-    Message string `json:"message"`
-    Type    string `json:"type"`
+    Message  string                 `json:"message"`
+    Type     string                 `json:"type"`
+    Param    string                 `json:"param,omitempty"`
+    Code     interface{}            `json:"code,omitempty"`
+    Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
 func (a *Agent) doRequest(ctx context.Context, payload ChatCompletionRequest) (*ChatCompletionResponse, error) {
@@ -128,10 +131,22 @@ func (a *Agent) doRequest(ctx context.Context, payload ChatCompletionRequest) (*
 // failure; fall back to the raw (truncated) body otherwise.
 func errorBodyMessage(data []byte) string {
     var wrapper struct {
-        Error *APIError `json:"error"`
+        Error   *APIError `json:"error"`
+        Message string    `json:"message"`
     }
-    if err := json.Unmarshal(data, &wrapper); err == nil && wrapper.Error != nil && wrapper.Error.Message != "" {
-        return wrapper.Error.Message
+    if err := json.Unmarshal(data, &wrapper); err == nil {
+        if wrapper.Error != nil {
+        	msg := strings.TrimSpace(wrapper.Error.Message)
+        	if msg != "" {
+        		if detail := providerErrorDetail(wrapper.Error.Metadata); detail != "" && isGenericProviderMessage(msg) {
+        			return msg + ": " + detail
+        		}
+        		return msg
+        	}
+        }
+        if strings.TrimSpace(wrapper.Message) != "" {
+        	return strings.TrimSpace(wrapper.Message)
+        }
     }
     s := strings.TrimSpace(string(data))
     if s == "" {
@@ -141,4 +156,47 @@ func errorBodyMessage(data []byte) string {
         s = s[:maxErrorBody] + "...(truncated)"
     }
     return s
+}
+
+func isGenericProviderMessage(msg string) bool {
+    switch strings.ToLower(strings.TrimSpace(msg)) {
+    case "provider returned error", "bad request", "request failed", "invalid request":
+    	return true
+    default:
+    	return false
+    }
+}
+
+func providerErrorDetail(metadata map[string]interface{}) string {
+    if len(metadata) == 0 {
+    	return ""
+    }
+    for _, key := range []string{"raw", "reason", "provider_error", "details", "message"} {
+    	if v, ok := metadata[key]; ok {
+    		if s := stringifyMetaValue(v); s != "" {
+    			return s
+    		}
+    	}
+    }
+    return ""
+}
+
+func stringifyMetaValue(v interface{}) string {
+    switch x := v.(type) {
+    case string:
+    	return strings.TrimSpace(x)
+    case fmt.Stringer:
+    	return strings.TrimSpace(x.String())
+    case map[string]interface{}, []interface{}:
+    	b, err := json.Marshal(x)
+    	if err != nil {
+    		return ""
+    	}
+    	return strings.TrimSpace(string(b))
+    default:
+    	if x == nil {
+    		return ""
+    	}
+    	return strings.TrimSpace(fmt.Sprintf("%v", x))
+    }
 }
