@@ -140,6 +140,7 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (string, error) {
 
         choice := resp.Choices[0]
         assistantMsg := choice.Message
+        sanitizeToolCalls(&assistantMsg)
         a.history = append(a.history, assistantMsg)
 
         if len(assistantMsg.ToolCalls) == 0 {
@@ -162,6 +163,46 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (string, error) {
     }
 
     return "", fmt.Errorf("max tool turns (%d) exceeded without final answer", maxTurns)
+}
+
+// sanitizeToolCalls repairs tool_calls emitted by non-conformant providers
+// before they are stored in history and later replayed verbatim in a
+// subsequent request. Two failure modes are handled defensively:
+//
+//  1. Empty, null-derived, or truncated "arguments" strings. Per the
+//     OpenAI tool-calling contract, function.arguments must always be a
+//     string that itself parses as a JSON object. Some provider/model
+//     combinations (seen via OpenRouter and some local models) instead
+//     send "" or a JSON null for arguments — which Go's decoder silently
+//     turns into "" on a string field, with no unmarshal error — or they
+//     truncate mid-object when generation is cut short. Replaying that
+//     string on the next turn is exactly what produces errors like:
+//       "tool arguments must be a stringified JSON object"
+//     Repairing it to "{}" instead lets executeTool's own required-field
+//     checks (e.g. "Error: missing command") surface a normal, recoverable
+//     tool result that the model can react to, instead of a hard,
+//     unrecoverable request failure that kills the whole turn.
+//  2. A missing/empty tool_call id. Several OpenAI-compatible providers
+//     require a non-empty, unique id on every tool call and reject a
+//     replayed empty one outright.
+func sanitizeToolCalls(msg *Message) {
+    for i := range msg.ToolCalls {
+        tc := &msg.ToolCalls[i]
+        if tc.Type == "" {
+            tc.Type = "function"
+        }
+        if strings.TrimSpace(tc.ID) == "" {
+            tc.ID = fmt.Sprintf("call_repaired_%d_%d", time.Now().UnixNano(), i)
+        }
+        args := strings.TrimSpace(tc.Function.Arguments)
+        var probe map[string]interface{}
+        // A JSON literal "null" unmarshals into a nil map with no error, so
+        // it needs its own check alongside the empty-string and malformed/
+        // truncated cases that Unmarshal does reject.
+        if err := json.Unmarshal([]byte(args), &probe); err != nil || probe == nil {
+            tc.Function.Arguments = "{}"
+        }
+    }
 }
 
 // applyExtractedPatches applies ### path SEARCH/REPLACE blocks that the
