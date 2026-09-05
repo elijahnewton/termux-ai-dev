@@ -21,12 +21,34 @@ func allowedRoots() []string {
     return roots
 }
 
+// resolveSymlinkAware resolves target's symlinks. If target doesn't exist
+// yet — as when write_file is about to create a brand-new file or a new
+// subdirectory — plain EvalSymlinks would just error, so this walks up to
+// the nearest existing ancestor, resolves that instead, and rejoins the
+// missing suffix. A symlinked parent still can't be used to escape the
+// allow-list check below.
+func resolveSymlinkAware(target string) (string, error) {
+    if resolved, err := filepath.EvalSymlinks(target); err == nil {
+        return resolved, nil
+    }
+    dir := filepath.Dir(target)
+    if dir == target {
+        return "", fmt.Errorf("cannot resolve path %s", target)
+    }
+    resolvedDir, err := resolveSymlinkAware(dir)
+    if err != nil {
+        return "", err
+    }
+    return filepath.Join(resolvedDir, filepath.Base(target)), nil
+}
+
 // isPathAllowed verifies that target — after symlink resolution — lies
 // strictly inside one of the allowed roots. The separator-aware prefix
 // prevents /home/user-evil from passing a /home/user check, and
-// EvalSymlinks prevents symlink escape.
+// resolveSymlinkAware prevents symlink escape (for both existing and
+// not-yet-created paths).
 func isPathAllowed(target string) error {
-    resolved, err := filepath.EvalSymlinks(target)
+    resolved, err := resolveSymlinkAware(target)
     if err != nil {
         return err
     }
@@ -42,9 +64,13 @@ func isPathAllowed(target string) error {
     return fmt.Errorf("path %s escapes allowed directories (must be under cwd or HOME)", target)
 }
 
-func ApplySearchReplace(path, search, replace string) error {
+// resolveTarget cleans path (joining it against cwd first if relative) and
+// verifies it's inside an allowed root. Shared by ApplySearchReplace here
+// and by write_file/read_file/list_directory in files.go so every
+// filesystem-touching tool enforces the exact same boundary.
+func resolveTarget(path string) (string, error) {
     if path == "" {
-        return errors.New("empty path")
+        return "", errors.New("empty path")
     }
     var target string
     if filepath.IsAbs(path) {
@@ -52,12 +78,19 @@ func ApplySearchReplace(path, search, replace string) error {
     } else {
         cwd, err := os.Getwd()
         if err != nil {
-            return err
+            return "", err
         }
         target = filepath.Join(cwd, filepath.Clean(path))
     }
-
     if err := isPathAllowed(target); err != nil {
+        return "", err
+    }
+    return target, nil
+}
+
+func ApplySearchReplace(path, search, replace string) error {
+    target, err := resolveTarget(path)
+    if err != nil {
         return err
     }
 
@@ -134,4 +167,29 @@ func ExtractPatches(text string) []Patch {
         })
     }
     return patches
+}
+
+// FileBlock is a "### path" header followed by a fenced code block,
+// the plain-text fallback for a whole-file write (new file, or full
+// rewrite) when the model emits text instead of calling write_file.
+type FileBlock struct {
+    File    string
+    Content string
+}
+
+// fileBlockRe matches "### path\n```lang\ncontent\n```". Built by
+// concatenation (rather than one raw string) only because a raw string
+// can't itself contain the backtick fence.
+var fileBlockRe = regexp.MustCompile(`(?m)^### ([^\n]+)\n` + "```" + `[a-zA-Z0-9_+-]*\n([\s\S]*?)\n` + "```")
+
+func ExtractFileBlocks(text string) []FileBlock {
+    var blocks []FileBlock
+    for _, m := range fileBlockRe.FindAllStringSubmatch(text, -1) {
+        file := strings.TrimSpace(m[1])
+        if file == "" || len(strings.Fields(file)) != 1 {
+            continue // skip stray "### ..." headers the model used as prose, not a real path
+        }
+        blocks = append(blocks, FileBlock{File: file, Content: m[2]})
+    }
+    return blocks
 }
