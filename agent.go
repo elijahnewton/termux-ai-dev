@@ -11,27 +11,41 @@ import (
     "time"
 )
 
-const defaultSystemPrompt = `You are TermuxAgent, an expert systems programming assistant operating inside Android Termux. Your environment is severely resource-constrained.
+const defaultSystemPrompt = `You are TermuxAgent, a full agentic software development environment running inside Android Termux. You build real, runnable projects directly on the filesystem — you do not describe or paste code in chat, you create it on disk.
 
-CRITICAL CONSTRAINTS:
-1. Android Phantom Process Killer (PPK): Termux background processes are aggressively terminated by Android after a few minutes. Never spawn long-running daemons, background jobs, or watchers. Every command must be targeted, synchronous, and fast.
-2. Network & Memory: Mobile data is metered and RAM is limited. Keep responses concise. Avoid redundant tool calls.
-3. File Editing: You MUST use the apply_search_replace tool to edit files. Never rewrite an entire file unless it is new or trivially small (<20 lines).
-4. Shell Commands: All execute_command calls must use strict timeouts, non-blocking flags where possible, and target specific files. Avoid broad searches like "find / -type f".
-5. Output Compaction: If tool output is large, summarize it for the user. Do not echo raw hex dumps or long build logs verbatim unless asked.
-6. Provider Agnostic: You are connected to an OpenAI-compatible API endpoint. The provider may be OpenAI, OpenRouter, Groq, Together AI, a local LLM, or any other compatible service. Do not assume provider-specific capabilities beyond standard tool calling and chat completions.
+ENVIRONMENT CONSTRAINTS:
+1. Android Phantom Process Killer (PPK): Termux background processes are aggressively terminated by Android after a few minutes. Never spawn long-running daemons, background jobs, or watchers. Every shell command must be targeted, synchronous, and fast.
+2. Network & Memory: mobile data is metered and RAM is limited. Keep your prose short; spend your output budget on files and commands, not commentary.
+3. Provider Agnostic: you're connected to an OpenAI-compatible API endpoint (OpenAI, OpenRouter, Groq, Together AI, a local model, or similar). Don't assume capabilities beyond standard tool calling and chat completions.
 
-When editing files, prefer this exact format in your thoughts or when not using tools:
-### path/to/file
-<<<<<<< SEARCH
-exact old lines
-=======
-exact new lines
->>>>>>> REPLACE
+HOW YOU BUILD PROJECTS — this is the most important part of your job:
+- Never paste a full file's contents into your chat reply. Every file you create or change must go through a tool call, so it actually lands in a real project folder the user can cd into, run, and commit to git.
+- Use write_file to create every new file. It auto-creates missing parent directories, so writing to "myapp/src/index.html" scaffolds "myapp/src/" too. One write_file call per file — never try to cram a whole multi-file app into one call or one response.
+- Use apply_search_replace only for a small, targeted edit to a file that already exists. Call read_file first if you aren't certain of its exact current content — never guess at search text.
+- Use list_directory to confirm what's actually on disk, especially after scaffolding a project or before editing one you didn't just create.
+- A single response has a limited output budget and cannot fit an entire real-world app. For anything more than a trivial script: first decide the file list, then create files one by one across as many tool calls and turns as it takes. If a single file would be unusually large, split it into smaller modules instead of trying to force it into one response.
+- Once everything is written, verify with list_directory, then give the user a short summary plus the exact command to run or open it (e.g. "python3 -m http.server 8000" for a static site, "node index.js", "termux-open index.html").
+- Shell commands (execute_command) must use strict timeouts, be non-blocking where possible, and target specific files — avoid broad searches like "find / -type f". If tool output is large, summarize it rather than echoing it verbatim.
+- Fallback text format: if a provider ever drops tool-calling mid-conversation, plain text in exactly these forms is auto-applied to disk instead of just sitting in chat:
+  New or fully-rewritten file:
+    ### path/to/file
+    ` + "```" + `
+    full file content
+    ` + "```" + `
+  Small edit to an existing file:
+    ### path/to/file
+    <<<<<<< SEARCH
+    exact old lines
+    =======
+    exact new lines
+    >>>>>>> REPLACE
 
 You have access to:
-- execute_command: Run a shell command in Termux.
-- apply_search_replace: Apply a search/replace patch to a file.`
+- write_file: create or fully overwrite a file (auto-creates parent directories).
+- read_file: read a file's real current content.
+- list_directory: see the real on-disk project layout.
+- apply_search_replace: apply a small, exact patch to an existing file.
+- execute_command: run a shell command in Termux (installs, builds, tests, git, etc).`
 
 type AgentConfig struct {
     APIKey        string
@@ -54,6 +68,60 @@ type Agent struct {
 
 func NewAgent(cfg AgentConfig) *Agent {
     tools := []Tool{
+        {
+            Type: "function",
+            Function: ToolDefinition{
+                Name:        "write_file",
+                Description: "Create a new file, or fully overwrite an existing one, with the given content. Automatically creates any missing parent directories, so this is also how new project folders get scaffolded. Use one call per file; use apply_search_replace instead for a small edit to a file that should otherwise be left alone.",
+                Parameters: map[string]interface{}{
+                    "type": "object",
+                    "properties": map[string]interface{}{
+                        "path": map[string]interface{}{
+                            "type":        "string",
+                            "description": "Relative (to the current directory) or absolute file path, e.g. 'checkers/index.html'.",
+                        },
+                        "content": map[string]interface{}{
+                            "type":        "string",
+                            "description": "The full content to write to the file.",
+                        },
+                    },
+                    "required": []string{"path", "content"},
+                },
+            },
+        },
+        {
+            Type: "function",
+            Function: ToolDefinition{
+                Name:        "read_file",
+                Description: "Read a file's real current on-disk content, so an edit or apply_search_replace patch can be based on what's actually there instead of assumption.",
+                Parameters: map[string]interface{}{
+                    "type": "object",
+                    "properties": map[string]interface{}{
+                        "path": map[string]interface{}{
+                            "type":        "string",
+                            "description": "Relative or absolute file path.",
+                        },
+                    },
+                    "required": []string{"path"},
+                },
+            },
+        },
+        {
+            Type: "function",
+            Function: ToolDefinition{
+                Name:        "list_directory",
+                Description: "Recursively list files and folders under a directory (skipping .git, node_modules, and vendor) to confirm the real project layout on disk.",
+                Parameters: map[string]interface{}{
+                    "type": "object",
+                    "properties": map[string]interface{}{
+                        "path": map[string]interface{}{
+                            "type":        "string",
+                            "description": "Directory to list. Defaults to the current directory if omitted.",
+                        },
+                    },
+                },
+            },
+        },
         {
             Type: "function",
             Function: ToolDefinition{
@@ -147,7 +215,7 @@ func (a *Agent) RunTurn(ctx context.Context, userText string) (string, error) {
             final := assistantMsg.Content
             // The system prompt invites plain-text SEARCH/REPLACE blocks as a
             // fallback; apply them so those edits aren't silently dropped.
-            if notes := a.applyExtractedPatches(final); notes != "" {
+            if notes := a.applyExtractedEdits(final); notes != "" {
                 final += "\n\n" + notes
             }
             if choice.FinishReason == "length" {
@@ -205,17 +273,16 @@ func sanitizeToolCalls(msg *Message) {
     }
 }
 
-// applyExtractedPatches applies ### path SEARCH/REPLACE blocks that the
-// model emitted in its final text instead of via the tool. Returns a
-// human-readable summary, or "" if no applicable patches were found.
-func (a *Agent) applyExtractedPatches(text string) string {
-    patches := ExtractPatches(text)
-    if len(patches) == 0 {
-        return ""
-    }
+// applyExtractedEdits applies "### path" SEARCH/REPLACE patches and
+// "### path" + fenced-code file blocks that the model emitted as plain
+// text instead of via apply_search_replace/write_file (a fallback for
+// providers that occasionally drop tool-calling mid-conversation).
+// Returns a human-readable summary, or "" if nothing applicable was found.
+func (a *Agent) applyExtractedEdits(text string) string {
     var b strings.Builder
     applied, failed := 0, 0
-    for _, p := range patches {
+
+    for _, p := range ExtractPatches(text) {
         // Require a single-token path to skip examples the model echoes.
         if p.File == "" || len(strings.Fields(p.File)) != 1 {
             continue
@@ -225,12 +292,24 @@ func (a *Agent) applyExtractedPatches(text string) string {
             fmt.Fprintf(&b, "patch to %s failed: %v\n", p.File, err)
         } else {
             applied++
+            fmt.Fprintf(&b, "patched %s\n", p.File)
         }
     }
+
+    for _, fb := range ExtractFileBlocks(text) {
+        if _, err := WriteFile(fb.File, fb.Content); err != nil {
+            failed++
+            fmt.Fprintf(&b, "write %s failed: %v\n", fb.File, err)
+        } else {
+            applied++
+            fmt.Fprintf(&b, "wrote %s\n", fb.File)
+        }
+    }
+
     if applied == 0 && failed == 0 {
         return ""
     }
-    return fmt.Sprintf("[auto-applied %d patch(es), %d failed]\n%s", applied, failed, b.String())
+    return fmt.Sprintf("[auto-applied %d edit(s), %d failed]\n%s", applied, failed, b.String())
 }
 
 func (a *Agent) buildMessages() []Message {
@@ -241,46 +320,15 @@ func (a *Agent) buildMessages() []Message {
     return out
 }
 
+// executeTool runs one tool call, showing a spinner while it's in flight
+// and then printing a one-line result to the terminal — so the person
+// watching sees files actually being written and commands actually being
+// run, not just silence until a chat reply appears.
 func (a *Agent) executeTool(ctx context.Context, tc ToolCall) Message {
-    var result string
-    switch tc.Function.Name {
-    case "execute_command":
-        var args struct {
-            Command string `json:"command"`
-        }
-        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-            result = fmt.Sprintf("Error parsing arguments: %v", err)
-        } else if args.Command == "" {
-            result = "Error: missing command"
-        } else {
-            out, err := ExecuteCommand(ctx, args.Command, a.cfg.ShellTimeout)
-            if err != nil {
-                result = fmt.Sprintf("Error: %v\nOutput: %s", err, out)
-            } else {
-                result = out
-            }
-            result = compressContent(result)
-        }
-    case "apply_search_replace":
-        var args struct {
-            Path    string `json:"path"`
-            Search  string `json:"search"`
-            Replace string `json:"replace"`
-        }
-        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-            result = fmt.Sprintf("Error parsing arguments: %v", err)
-        } else if args.Path == "" {
-            result = "Error: missing path"
-        } else {
-            if err := ApplySearchReplace(args.Path, args.Search, args.Replace); err != nil {
-                result = fmt.Sprintf("Error applying patch: %v", err)
-            } else {
-                result = "Patch applied successfully."
-            }
-        }
-    default:
-        result = fmt.Sprintf("Error: unknown tool %s", tc.Function.Name)
-    }
+    spinner := NewSpinner(fmt.Sprintf("Running %s...", tc.Function.Name))
+    result, detail, ok, note := a.runTool(ctx, tc)
+    spinner.Stop()
+    printToolActivity(tc.Function.Name, detail, ok, note)
 
     if estimateTokens(result) > 800 {
         result = truncateLines(result, 30) + "\n... (output truncated by agent)"
@@ -290,6 +338,102 @@ func (a *Agent) executeTool(ctx context.Context, tc ToolCall) Message {
         Role:       "tool",
         ToolCallID: tc.ID,
         Content:    result,
+    }
+}
+
+// runTool executes one tool call and returns: the full result to send back
+// to the model, a short "detail" identifying what it acted on (a path or a
+// command) for the console line, whether it succeeded, and a short
+// human-readable outcome note for that same line.
+func (a *Agent) runTool(ctx context.Context, tc ToolCall) (result, detail string, ok bool, note string) {
+    switch tc.Function.Name {
+    case "execute_command":
+        var args struct {
+            Command string `json:"command"`
+        }
+        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+            return fmt.Sprintf("Error parsing arguments: %v", err), "", false, err.Error()
+        }
+        detail = args.Command
+        if args.Command == "" {
+            return "Error: missing command", detail, false, "missing command"
+        }
+        out, err := ExecuteCommand(ctx, args.Command, a.cfg.ShellTimeout)
+        if err != nil {
+            return fmt.Sprintf("Error: %v\nOutput: %s", err, out), detail, false, err.Error()
+        }
+        return compressContent(out), detail, true, ""
+
+    case "write_file":
+        var args struct {
+            Path    string `json:"path"`
+            Content string `json:"content"`
+        }
+        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+            return fmt.Sprintf("Error parsing arguments: %v", err), "", false, err.Error()
+        }
+        detail = args.Path
+        if args.Path == "" {
+            return "Error: missing path", detail, false, "missing path"
+        }
+        msg, err := WriteFile(args.Path, args.Content)
+        if err != nil {
+            return fmt.Sprintf("Error writing file: %v", err), detail, false, err.Error()
+        }
+        return msg, detail, true, fmt.Sprintf("(%d bytes)", len(args.Content))
+
+    case "read_file":
+        var args struct {
+            Path string `json:"path"`
+        }
+        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+            return fmt.Sprintf("Error parsing arguments: %v", err), "", false, err.Error()
+        }
+        detail = args.Path
+        if args.Path == "" {
+            return "Error: missing path", detail, false, "missing path"
+        }
+        content, err := ReadFile(args.Path)
+        if err != nil {
+            return fmt.Sprintf("Error reading file: %v", err), detail, false, err.Error()
+        }
+        return content, detail, true, ""
+
+    case "list_directory":
+        var args struct {
+            Path string `json:"path"`
+        }
+        _ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+        detail = args.Path
+        if detail == "" {
+            detail = "."
+        }
+        listing, err := ListDirectory(args.Path)
+        if err != nil {
+            return fmt.Sprintf("Error listing directory: %v", err), detail, false, err.Error()
+        }
+        return listing, detail, true, ""
+
+    case "apply_search_replace":
+        var args struct {
+            Path    string `json:"path"`
+            Search  string `json:"search"`
+            Replace string `json:"replace"`
+        }
+        if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+            return fmt.Sprintf("Error parsing arguments: %v", err), "", false, err.Error()
+        }
+        detail = args.Path
+        if args.Path == "" {
+            return "Error: missing path", detail, false, "missing path"
+        }
+        if err := ApplySearchReplace(args.Path, args.Search, args.Replace); err != nil {
+            return fmt.Sprintf("Error applying patch: %v", err), detail, false, err.Error()
+        }
+        return "Patch applied successfully.", detail, true, ""
+
+    default:
+        return fmt.Sprintf("Error: unknown tool %s", tc.Function.Name), tc.Function.Name, false, "unknown tool"
     }
 }
 
