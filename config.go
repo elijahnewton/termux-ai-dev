@@ -87,14 +87,24 @@ type UserConfig struct {
 
 func defaultUserConfig() *UserConfig {
     return &UserConfig{
-        Provider:      "openai",
-        Endpoint:      providerPresets["openai"].Endpoint,
-        Model:         "gpt-4o-mini",
-        MaxTokens:     1024,
-        HistoryBudget: 8000,
-        ShellTimeout:  15,
-        MaxTurns:      10,
-        ExtraHeaders:  make(map[string]string),
+        Provider:  "openai",
+        Endpoint:  providerPresets["openai"].Endpoint,
+        Model:     "gpt-4o-mini",
+        // 1024 was tight enough to truncate a single write_file call mid-
+        // JSON on anything but a trivial file. 8192 comfortably fits a
+        // full HTML/CSS/JS-sized file in one tool call; raise further with
+        // /settings if your provider and model support a larger window.
+        MaxTokens: 8192,
+        // Read/list tool results are bulkier than shell output, so a
+        // multi-file project fills this faster than the old chat-only
+        // flow did.
+        HistoryBudget: 16000,
+        // Installs and builds routinely run past 15s in Termux.
+        ShellTimeout: 30,
+        // A real project is one write_file call per file plus occasional
+        // read_file/list_directory checks — far more than 10 tool calls.
+        MaxTurns:     40,
+        ExtraHeaders: make(map[string]string),
     }
 }
 
