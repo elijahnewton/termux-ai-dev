@@ -33,7 +33,7 @@ func resolveShell() string {
 
 func ExecuteCommand(ctx context.Context, cmd string, timeout time.Duration) (string, error) {
     if timeout <= 0 {
-        timeout = 15 * time.Second
+        timeout = 60 * time.Second
     }
     ctx, cancel := context.WithTimeout(ctx, timeout)
     defer cancel()

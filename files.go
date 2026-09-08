@@ -121,10 +121,10 @@ func ListDirectory(path string) (string, error) {
         if p == target {
             return nil
         }
-        name := fi.Name()
-        if fi.IsDir() && (name == ".git" || name == "node_modules" || name == "vendor") {
-            return filepath.SkipDir
-        }
+		name := fi.Name()
+		if fi.IsDir() && noiseDirNames[name] {
+			return filepath.SkipDir
+		}
         if len(lines) >= maxListEntries {
             return errListLimit
         }
